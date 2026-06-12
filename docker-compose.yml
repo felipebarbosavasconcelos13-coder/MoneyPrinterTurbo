@@ -6,15 +6,25 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: "moneyprinterturbo-webui"
-    command: [ "streamlit", "run", "./webui/Main.py","--browser.serverAddress=127.0.0.1","--server.enableCORS=True","--browser.gatherUsageStats=False" ]
-    volumes: *common-volumes
+    expose:
+      - "8501"
+    command:
+      - streamlit
+      - run
+      - ./webui/Main.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.enableCORS=false
+      - --browser.gatherUsageStats=false
     restart: always
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: "moneyprinterturbo-api"
-    command: [ "python3", "main.py" ]
-    volumes: *common-volumes
+    expose:
+      - "8080"
+    command:
+      - python3
+      - main.py
     restart: always
