@@ -17,6 +17,14 @@ services:
       - --server.enableCORS=false
       - --browser.gatherUsageStats=false
     restart: always
+    labels:
+      - "coolify.managed=true"
+      - "traefik.enable=true"
+      - "traefik.http.routers.mpt-web.rule=Host(`moneyprinterturbo.genialsolucoesdigitais.com.br`)"
+      - "traefik.http.routers.mpt-web.entrypoints=websecure"
+      - "traefik.http.routers.mpt-web.tls=true"
+      - "traefik.http.routers.mpt-web.tls.certresolver=letsencrypt"
+      - "traefik.http.services.mpt-web.loadbalancer.server.port=8501"
 
   api:
     build:
@@ -28,3 +36,11 @@ services:
       - python3
       - main.py
     restart: always
+    labels:
+      - "coolify.managed=true"
+      - "traefik.enable=true"
+      - "traefik.http.routers.mpt-api.rule=Host(`api-moneyprinterturbo.genialsolucoesdigitais.com.br`)"
+      - "traefik.http.routers.mpt-api.entrypoints=websecure"
+      - "traefik.http.routers.mpt-api.tls=true"
+      - "traefik.http.routers.mpt-api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.mpt-api.loadbalancer.server.port=8080"
