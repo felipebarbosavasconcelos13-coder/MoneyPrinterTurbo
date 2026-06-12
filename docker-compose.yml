@@ -17,8 +17,6 @@ services:
       - --server.enableCORS=false
       - --browser.gatherUsageStats=false
     restart: always
-    networks:
-      - coolify
     labels:
       - "coolify.managed=true"
 
@@ -32,12 +30,5 @@ services:
       - python3
       - main.py
     restart: always
-    networks:
-      - coolify
     labels:
       - "coolify.managed=true"
-
-networks:
-  coolify:
-    external: true
-    name: coolify
