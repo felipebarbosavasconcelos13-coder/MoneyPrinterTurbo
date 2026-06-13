@@ -15,8 +15,11 @@ services:
       - --server.address=0.0.0.0
       - --server.port=8501
       - --server.enableCORS=false
+      - --server.enableXsrfProtection=false
       - --browser.gatherUsageStats=false
     restart: always
+    networks:
+      - coolify
     labels:
       - "coolify.managed=true"
 
@@ -30,5 +33,11 @@ services:
       - python3
       - main.py
     restart: always
+    networks:
+      - coolify
     labels:
       - "coolify.managed=true"
+
+networks:
+  coolify:
+    external: true
