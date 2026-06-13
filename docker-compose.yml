@@ -22,7 +22,7 @@ services:
       - coolify
     labels:
       - "coolify.managed=true"
-      - "traefik.http.services.webui.loadbalancer.server.port=8501"
+      - "traefik.docker.network=coolify"
 
   api:
     build:
@@ -38,7 +38,7 @@ services:
       - coolify
     labels:
       - "coolify.managed=true"
-      - "traefik.http.services.api.loadbalancer.server.port=8080"
+      - "traefik.docker.network=coolify"
 
 networks:
   coolify:
