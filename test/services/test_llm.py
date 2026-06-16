@@ -128,8 +128,14 @@ class TestScriptPromptOptions(unittest.TestCase):
         API 请求模型需要限制高级 prompt 参数，避免外部调用绕过 WebUI
         传入异常段落数或超长提示词，导致模型成本和结果不可控。
         """
+        request = VideoScriptRequest(video_subject="咖啡", paragraph_number=25)
+        self.assertEqual(request.paragraph_number, 25)
+
         with self.assertRaises(ValidationError):
             VideoScriptRequest(video_subject="咖啡", paragraph_number=0)
+
+        with self.assertRaises(ValidationError):
+            VideoScriptRequest(video_subject="咖啡", paragraph_number=26)
 
         with self.assertRaises(ValidationError):
             VideoScriptRequest(
