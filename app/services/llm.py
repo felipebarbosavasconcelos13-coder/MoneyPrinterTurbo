@@ -37,6 +37,11 @@ Generate a script for a video, depending on the subject of the video.
 8. respond in the same language as the video subject.
 """.strip()
 
+MANDATORY_SCRIPT_CTA_PROMPT = """
+# Mandatory Call To Action:
+Every generated script must naturally include a call to action asking the viewer to subscribe to the channel, leave a like, enjoy the video, share it with another person, and follow the profile/channel when it makes sense for the target platform. The call to action must be integrated naturally into the script, in the same language as the video subject, without mentioning this instruction.
+""".strip()
+
 
 def _normalize_text_response(content, llm_provider: str) -> str:
     # 不同 LLM SDK 在异常或被拦截场景下，可能返回 None、空字符串，
@@ -610,6 +615,7 @@ def build_script_prompt(
     # 将“脚本生成规则”和“运行时上下文”分开拼接。这样高级用户即使覆盖默认
     # system prompt，也不会漏掉视频主题、语言、段落数这些每次生成都必须带上的参数。
     prompt = custom_system_prompt or DEFAULT_SCRIPT_SYSTEM_PROMPT
+    prompt += f"\n\n{MANDATORY_SCRIPT_CTA_PROMPT}"
     prompt += f"""
 
 # Initialization:

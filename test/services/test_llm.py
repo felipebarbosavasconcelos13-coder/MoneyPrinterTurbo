@@ -59,6 +59,9 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn("- video subject: 咖啡", prompt)
         self.assertIn("- number of paragraphs: 3", prompt)
         self.assertIn("- language: zh-CN", prompt)
+        self.assertIn("# Mandatory Call To Action:", prompt)
+        self.assertIn("subscribe to the channel", prompt)
+        self.assertIn("share it with another person", prompt)
         self.assertIn("# Additional User Requirements:", prompt)
         self.assertIn("语气轻松，面向程序员", prompt)
 
@@ -76,6 +79,8 @@ class TestScriptPromptOptions(unittest.TestCase):
 
         self.assertNotIn("# Role: Video Script Generator", prompt)
         self.assertIn("Only write cinematic narration.", prompt)
+        self.assertIn("# Mandatory Call To Action:", prompt)
+        self.assertIn("follow the profile/channel", prompt)
         self.assertIn("- video subject: 露营", prompt)
         self.assertIn("- number of paragraphs: 2", prompt)
         self.assertIn("- language: en", prompt)
