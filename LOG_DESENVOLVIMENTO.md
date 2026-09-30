@@ -2,6 +2,35 @@
 
 Este arquivo registra alteracoes relevantes feitas no projeto **MoneyPrinterTurbo**, com foco em manutencao, deploy e decisoes operacionais.
 
+## [30/09/2026] - Atualizacao Completa para o Upstream mais recente e Deploy no Coolify
+
+### 1. Criacao da Salvaguarda Remota (Branch de Backup)
+- Criada branch remota `backup-before-upstream-update` a partir do commit `f47bd3b3fc624f81da00702c481ba21066d54f5c` no GitHub, garantindo rollback instantaneo se necessario.
+
+### 2. Base Upstream e Commits Atomicos de Customizacao
+- Criada branch `upgrade-moneyprinterturbo` baseada exatamente no commit mais recente do upstream `harry0703/MoneyPrinterTurbo` (`f420c092ee56e92035db0115d900f8a9d4c1abfe`).
+- Reaplicadas as customizacoes em commits atomicos:
+  1. `a27badc`: `feat: allow up to 25 script paragraphs` (`app/models/schema.py`, `app/services/llm.py`, `test/services/test_llm.py`).
+  2. `2683e0f`: `feat: add mandatory CTA to generated scripts` (`app/services/llm.py`, `test/services/test_llm.py`).
+  3. `1752bab`: `fix: adapt docker configuration for Coolify and Traefik` (`docker-compose.yml`).
+  4. `1135bb0`: `test: remove non-ascii debug prints in test_video for windows console compatibility` (`test/services/test_video.py`).
+  5. `55ee8bc`: `docs: add project documentation, implementation plan and agents guidelines`.
+
+### 3. Validacao de Testes Locais
+- `uv run python -m unittest test.services.test_llm`: 115 testes executados com sucesso (1 skipped).
+- `uv run python -m unittest test.services.test_controller_llm`: 4 testes executados com sucesso.
+- `uv run python -m unittest test.services.test_video`: 72 testes executados com sucesso.
+
+### 4. Pull Request e Integracao no Main
+- Criado Pull Request #1 no GitHub (`felipebarbosavasconcelos13-coder/MoneyPrinterTurbo/pull/1`).
+- Merge executado e integrado no branch `main` com o commit `210607be378905fb197e36482170460e59548ec2`.
+- Push realizado com sucesso para `origin/main`.
+
+### 5. Deploy no Coolify
+- Disparado deploy com reconstrucao forçada (`force: true`) para a aplicacao `money-printer-turbo:completo` (UUID: `pn25p4iuncprsq6g5bnj3m84`).
+- Deployment UUID: `iosv0zcuen5dgfqp7nsfxsbe`.
+- BuildKit em execucao compilando as imagens do `docker-compose.yml` (servicos `webui` e `api`).
+
 ## [30/09/2026] - Auditoria Geral e Plano de Atualizacao para o Upstream Mais Recente
 
 ### Auditoria do GitHub

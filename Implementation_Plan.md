@@ -44,24 +44,27 @@ Este documento detalha o planejamento para atualizar o fork do **MoneyPrinterTur
 
 ---
 
-## 2. Estrategia de Execucao
+## 2. Estrategia de Execucao e Status Atual
 
 1. **Backup Remoto**:
-   - Criar e enviar branch `backup-before-upstream-update` a partir do commit `f47bd3b3fc624f81da00702c481ba21066d54f5c`.
+   - [x] Criada e enviada branch `backup-before-upstream-update` a partir do commit `f47bd3b3fc624f81da00702c481ba21066d54f5c`.
 2. **Branch de Integracao**:
-   - Criar branch `upgrade-moneyprinterturbo` baseada no commit `f420c092ee56e92035db0115d900f8a9d4c1abfe` (upstream/main).
+   - [x] Criada branch `upgrade-moneyprinterturbo` baseada no commit `f420c092ee56e92035db0115d900f8a9d4c1abfe` (upstream/main).
 3. **Reaplicacao das Customizacoes**:
-   - Reaplicar o limite de 25 paragrafos em `app/models/schema.py` e `app/services/llm.py`.
-   - Reaplicar `MANDATORY_SCRIPT_CTA_PROMPT` em `app/services/llm.py`.
-   - Configurar `docker-compose.yml` para integracao com Traefik e Coolify.
-   - Atualizar `test/services/test_llm.py`.
+   - [x] Reaplicado o limite de 25 paragrafos em `app/models/schema.py` e `app/services/llm.py` (commit `a27badc`).
+   - [x] Reaplicado `MANDATORY_SCRIPT_CTA_PROMPT` em `app/services/llm.py` (commit `2683e0f`).
+   - [x] Configurado `docker-compose.yml` para integracao com Traefik e rede `coolify` (commit `1752bab`).
+   - [x] Ajustado `test/services/test_video.py` para compatibilidade com consoles Windows CP1252 (commit `1135bb0`).
+   - [x] Adicionada documentacao e diretrizes (commit `55ee8bc`).
 4. **Validacao Local**:
-   - Executar os testes automatizados com `uv run python -m unittest test.services.test_llm`.
-   - Executar suíte de testes complementares.
-5. **Deploy Controlado no Coolify**:
-   - Push da branch `upgrade-moneyprinterturbo` para o GitHub.
-   - Deploy e verificacao em producao.
-6. **Rollback (se necessario)**:
-   - Apontar de volta para o commit `f47bd3b3fc624f81da00702c481ba21066d54f5c` e redeploy.
-7. **Merge no Main**:
-   - Apos confirmacao de 100% de sucesso, integrar no `main`.
+   - [x] Executados testes automatizados: `test_llm` (115 OK), `test_controller_llm` (4 OK), `test_video` (72 OK).
+5. **Pull Request e Integracao no Main**:
+   - [x] Criado PR #1 no GitHub e executado merge com integracao no `main` (commit `210607b`).
+   - [x] Push realizado com sucesso para `origin/main`.
+6. **Deploy no Coolify**:
+   - [x] Enfileirado deploy da versao atualizada via MCP Coolify (Deployment UUID: `iosv0zcuen5dgfqp7nsfxsbe`).
+   - [ ] Validacao dos smoke checks pos-deploy (WebUI e API).
+7. **Finalizacao e Documentacao**:
+   - [x] `LOG_DESENVOLVIMENTO.md` atualizado.
+   - [x] `Implementation_Plan.md` atualizado.
+   - [x] `DOCUMENTACAO.md` atualizado.
