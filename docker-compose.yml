@@ -1,24 +1,57 @@
-x-common-volumes: &common-volumes
-  - ./:/MoneyPrinterTurbo
-
 services:
   webui:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: "moneyprinterturbo-webui"
-    ports:
-      - "127.0.0.1:8501:8501"
-    command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=127.0.0.1", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
-    volumes: *common-volumes
+    expose:
+      - "8501"
+    command:
+      - streamlit
+      - run
+      - ./webui/Main.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.enableCORS=false
+      - --server.enableXsrfProtection=false
+      - --browser.gatherUsageStats=false
+      - --client.toolbarMode=minimal
+      - --logger.hideWelcomeMessage=True
+      - --server.showEmailPrompt=False
     restart: always
+    networks:
+      - coolify
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=coolify"
+      - "traefik.http.routers.moneyprinterturbo-webui.rule=Host(`moneyprinterturbo.genialsolucoesdigitais.com.br`)"
+      - "traefik.http.routers.moneyprinterturbo-webui.entrypoints=https"
+      - "traefik.http.routers.moneyprinterturbo-webui.tls=true"
+      - "traefik.http.routers.moneyprinterturbo-webui.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.moneyprinterturbo-webui.service=moneyprinterturbo-webui"
+      - "traefik.http.services.moneyprinterturbo-webui.loadbalancer.server.port=8501"
+
   api:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: "moneyprinterturbo-api"
-    ports:
-      - "127.0.0.1:8080:8080"
-    command: [ "python3", "main.py" ]
-    volumes: *common-volumes
+    expose:
+      - "8080"
+    command:
+      - python3
+      - main.py
     restart: always
+    networks:
+      - coolify
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=coolify"
+      - "traefik.http.routers.moneyprinterturbo-api.rule=Host(`api-moneyprinterturbo.genialsolucoesdigitais.com.br`)"
+      - "traefik.http.routers.moneyprinterturbo-api.entrypoints=https"
+      - "traefik.http.routers.moneyprinterturbo-api.tls=true"
+      - "traefik.http.routers.moneyprinterturbo-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.moneyprinterturbo-api.service=moneyprinterturbo-api"
+      - "traefik.http.services.moneyprinterturbo-api.loadbalancer.server.port=8080"
+
+networks:
+  coolify:
+    external: true
