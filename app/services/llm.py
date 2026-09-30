@@ -1,7 +1,12 @@
 import json
 import logging
+import math
+import os
 import re
-import requests
+import shutil
+import subprocess
+import tempfile
+from time import perf_counter
 from typing import List
 
 from loguru import logger
@@ -9,16 +14,23 @@ from openai import AzureOpenAI, OpenAI
 from openai.types.chat import ChatCompletion
 
 from app.config import config
+from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.utils import utils
 
 _max_retries = 5
-_DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-_DEPRECATED_GEMINI_MODELS = {"gemini-pro", "gemini-1.0-pro"}
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 25
 MAX_SCRIPT_PROMPT_LENGTH = 2000
 MAX_SCRIPT_SYSTEM_PROMPT_LENGTH = 8000
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
+_URL_USERINFO_RE = re.compile(
+    r"((?:https?|wss?)://)([^/\s?#@]*:[^/\s?#@]*@)", re.IGNORECASE
+)
+_SENSITIVE_QUERY_RE = re.compile(
+    r"([?&](?:api[_-]?key|access[_-]?token|token|key|secret|password)=)([^&#\s]+)",
+    re.IGNORECASE,
+)
 
 DEFAULT_SCRIPT_SYSTEM_PROMPT = """
 # Role: Video Script Generator
@@ -42,6 +54,115 @@ MANDATORY_SCRIPT_CTA_PROMPT = """
 Every generated script must naturally include a call to action asking the viewer to subscribe to the channel, leave a like, enjoy the video, share it with another person, and follow the profile/channel when it makes sense for the target platform. The call to action must be integrated naturally into the script, in the same language as the video subject, without mentioning this instruction.
 """.strip()
 
+# Claude Code CLI 默认使用编码 agent 的系统提示词，其中大量约束与文案写作
+# 无关，会让脚本和关键词生成偏离要求，因此调用时整体替换掉。
+CLAUDE_CODE_SYSTEM_PROMPT = (
+    "You are a concise copywriter. Follow the user's instructions and output "
+    "format exactly, and output nothing else."
+)
+CLAUDE_CODE_DEFAULT_TIMEOUT = 300.0
+# `--tools ""` 关闭全部内置工具，`--safe-mode` 关闭 CLAUDE.md、skills、hooks、
+# plugins、MCP 等所有用户级定制，同时保持鉴权、模型选择和权限正常工作。
+# 二者需要较新的 CLI；低版本会以 "unknown option" 退出，由调用处转成明确提示。
+CLAUDE_CODE_MIN_CLI_VERSION = "2.1.260"
+# 这些环境变量会让 CLI 改用 API Key 或第三方供应商（Bedrock、Vertex、Foundry、
+# Mantle、Gateway 等），从而绕过订阅登录并产生额外计费。逐个列举容易漏项，
+# 而且 CLI 后续还会新增供应商，因此按前缀整类剔除：
+#   ANTHROPIC_*           API Key、Auth Token、Base URL、各家供应商端点和 Profile
+#   CLAUDE_CODE_USE_*     供应商开关
+#   CLAUDE_CODE_SKIP_*_AUTH  跳过供应商鉴权的开关
+CLAUDE_CODE_CONFLICTING_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_")
+CLAUDE_CODE_CONFLICTING_ENV_VARS = (
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+)
+# 这两类变量不能剔除：
+#   CLAUDE_CODE_OAUTH_TOKEN 是容器内唯一的订阅鉴权方式（不匹配上面的前缀）；
+#   *_CONFIG_DIR 只是指出凭证存放位置，剔除后反而会让已登录的订阅失效。
+CLAUDE_CODE_PRESERVED_ENV_VARS = (
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_CONFIG_DIR",
+    "CLAUDE_CONFIG_DIR",
+)
+
+
+def _is_conflicting_claude_code_env(name: str) -> bool:
+    """判断某个环境变量是否会把 CLI 从订阅登录切换到别的鉴权方式。"""
+    if name in CLAUDE_CODE_PRESERVED_ENV_VARS:
+        return False
+    if name in CLAUDE_CODE_CONFLICTING_ENV_VARS:
+        return True
+    if name.startswith(CLAUDE_CODE_CONFLICTING_ENV_PREFIXES):
+        return True
+    return name.startswith("CLAUDE_CODE_SKIP_") and name.endswith("_AUTH")
+
+
+def coerce_claude_code_timeout(value, config_key: str = "claude_code_timeout"):
+    """
+    把配置里的超时值解析成正的有限秒数。
+
+    TOML 既可能写成 `claude_code_timeout = 300`（int/float），也可能写成
+    `"300"`（字符串），因此不能直接调用 `strip()`。nan / inf 会让
+    `subprocess.run(timeout=...)` 永久阻塞，这里一并拒绝。
+    """
+    if value is None:
+        return CLAUDE_CODE_DEFAULT_TIMEOUT
+
+    if isinstance(value, bool):
+        # bool 是 int 的子类，但 True 秒显然不是用户想要的超时配置。
+        raise ValueError(f"{config_key} must be a number of seconds, got {value!r}")
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return CLAUDE_CODE_DEFAULT_TIMEOUT
+        try:
+            seconds = float(text)
+        except ValueError:
+            raise ValueError(
+                f"{config_key} must be a number of seconds, got {value!r}"
+            ) from None
+    elif isinstance(value, (int, float)):
+        seconds = float(value)
+    else:
+        raise ValueError(f"{config_key} must be a number of seconds, got {value!r}")
+
+    if not math.isfinite(seconds):
+        raise ValueError(f"{config_key} must be a finite number, got {value!r}")
+    if seconds <= 0:
+        raise ValueError(f"{config_key} must be greater than 0, got {value!r}")
+    return seconds
+
+
+def _resolve_provider_field_value(raw_value, default_value):
+    """
+    只有「未配置」时才回退到 Registry 默认值。
+
+    之前用 `raw or default_value`，会把 0 和 false 这类合法取值也当成未配置
+    替换掉：`claude_code_timeout = 0` 被静默改成 300，而 `"0"` 却报错。默认值
+    只在 None 或空白字符串时生效，配置校验才能对所有写法保持一致。
+    """
+    if raw_value is None:
+        return default_value
+    if isinstance(raw_value, str) and not raw_value.strip():
+        return default_value
+    return raw_value
+
+
+def build_claude_code_env(base_env=None):
+    """
+    构造只依赖订阅登录的子进程环境。
+
+    返回 (环境变量字典, 被剔除的变量名列表)。剔除的是会切换鉴权方式或供应商
+    的变量，`CLAUDE_CODE_OAUTH_TOKEN` 必须保留：容器内没有 keychain，CLI 只能
+    靠它完成订阅鉴权。
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    removed = sorted(name for name in env if _is_conflicting_claude_code_env(name))
+    for name in removed:
+        env.pop(name, None)
+    return env, removed
+
 
 def _normalize_text_response(content, llm_provider: str) -> str:
     # 不同 LLM SDK 在异常或被拦截场景下，可能返回 None、空字符串，
@@ -63,7 +184,24 @@ def _normalize_text_response(content, llm_provider: str) -> str:
     if not content:
         raise ValueError(f"[{llm_provider}] returned empty text content")
 
-    return content.replace("\n", "")
+    # 前面的 ``strip()`` 已经清理首尾空白。这里必须保留正文中的单换行和
+    # 双换行：脚本生成依赖双换行区分段落，字幕处理也会按行读取用户文案。
+    return content
+
+
+def _sanitize_error_message(error: object) -> str:
+    """
+    清理返回给 WebUI/API 的错误信息，避免自定义 base_url 中的凭据泄露。
+
+    一些 OpenAI-compatible SDK 会把请求 URL 原样拼进异常信息。如果用户为了
+    代理网关配置了 `https://user:pass@example.com/v1`，直接返回 `str(e)`
+    就会把密码暴露给页面、API 调用方或后续日志。这里仅处理错误文案，不改变
+    实际请求地址，避免影响正常调用链路。
+    """
+    message = str(error)
+    message = _URL_USERINFO_RE.sub(r"\1***:***@", message)
+    message = _SENSITIVE_QUERY_RE.sub(r"\1***", message)
+    return message
 
 
 def _extract_chat_completion_text(response, llm_provider: str) -> str:
@@ -121,429 +259,209 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str) -> str:
+def _generate_response(prompt: str, app_config=None) -> str:
+    sdk_client = None
+    sdk_stream = None
     try:
-        content = ""
-        llm_provider = config.app.get("llm_provider", "openai")
+        # WebUI 在视频生成期间允许用户准备下一条文案。调用方可以传入提交瞬间
+        # 的配置快照，确保模型请求重试期间不会因为后台任务结束并应用新配置，
+        # 而切换到另一个 Provider、Base URL 或模型。
+        runtime_app_config = app_config if app_config is not None else config.app
+        llm_provider = str(
+            runtime_app_config.get("llm_provider", DEFAULT_LLM_PROVIDER_ID)
+        ).lower()
+        provider = get_llm_provider(llm_provider)
+        if provider is None:
+            raise ValueError(f"{llm_provider}: unsupported llm provider")
+
         logger.info(f"llm provider: {llm_provider}")
-        if llm_provider == "g4f":
-            if not config.app.get("enable_g4f", False):
+        api_key = runtime_app_config.get(provider.config_key("api_key"), "")
+        configured_model = runtime_app_config.get(provider.config_key("model_name"), "")
+        model_name = provider.resolve_model_name(configured_model)
+        if configured_model and model_name != configured_model:
+            logger.warning(
+                f"{llm_provider} model '{configured_model}' is deprecated, "
+                f"fallback to '{model_name}'"
+            )
+        configured_base_url = runtime_app_config.get(
+            provider.config_key("base_url"), ""
+        )
+        base_url = provider.resolve_base_url(configured_base_url)
+        if configured_base_url and configured_base_url.strip().rstrip("/") in {
+            url.rstrip("/") for url in provider.deprecated_base_urls
+        }:
+            logger.warning(
+                f"{llm_provider} base URL '{configured_base_url}' is deprecated, "
+                f"fallback to '{base_url}'"
+            )
+        adapter = provider.adapter
+        api_version = ""
+
+        # Ollama 的默认地址依赖当前是否运行在容器中，无法作为静态 Registry
+        # 值保存；Registry 仍负责模型和必填规则，运行环境差异在这里解析。
+        if llm_provider == "ollama":
+            api_key = "ollama"
+            if not base_url:
+                base_url = config.get_default_ollama_base_url()
+
+        if adapter == "azure":
+            api_version = runtime_app_config.get(
+                provider.config_key("api_version"), "2024-02-15-preview"
+            )
+
+        extra_values = {
+            field.config_suffix: _resolve_provider_field_value(
+                runtime_app_config.get(provider.config_key(field.config_suffix)),
+                field.default_value,
+            )
+            for field in provider.extra_fields
+        }
+
+        if provider.requires_api_key and not api_key:
+            raise ValueError(
+                f"{llm_provider}: api_key is not set, please set it in the config.toml file."
+            )
+        if provider.requires_model_name and not model_name:
+            raise ValueError(
+                f"{llm_provider}: model_name is not set, please set it in the config.toml file."
+            )
+        if provider.requires_base_url and not base_url:
+            raise ValueError(
+                f"{llm_provider}: base_url is not set, please set it in the config.toml file."
+            )
+
+        for field in provider.extra_fields:
+            if field.required and not extra_values[field.config_suffix]:
                 raise ValueError(
-                    "g4f provider is disabled by default because it relies on "
-                    "reverse-engineered third-party endpoints. Set enable_g4f=true "
-                    "in config.toml only if you understand and accept the security, "
-                    "reliability, and legal risks."
+                    f"{llm_provider}: {field.config_suffix} is not set, "
+                    "please set it in the config.toml file."
                 )
 
-            logger.warning(
-                "g4f provider is enabled. This provider may be unstable and carries "
-                "supply-chain and terms-of-service risks. Prefer official providers, "
-                "OpenAI-compatible APIs, LiteLLM, Ollama, or local inference for production."
-            )
-            try:
-                import g4f
-            except ImportError as e:
-                raise ValueError(
-                    "g4f package is not installed by default. Install the optional "
-                    "dependency with `uv sync --extra g4f` only if you understand "
-                    "and accept the provider risks."
-                ) from e
+        if adapter == "qwen":
+            import dashscope
+            from dashscope.api_entities.dashscope_response import GenerationResponse
 
-            model_name = config.app.get("g4f_model_name", "")
-            if not model_name:
-                model_name = "gpt-3.5-turbo-16k-0613"
-            content = g4f.ChatCompletion.create(
+            response = dashscope.Generation.call(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                api_key=api_key,
+            )
+            if response:
+                if isinstance(response, GenerationResponse):
+                    status_code = response.status_code
+                    if status_code != 200:
+                        raise Exception(
+                            f'[{llm_provider}] returned an error response: "{response}"'
+                        )
+
+                    return _extract_qwen_generation_text(response)
+                else:
+                    raise Exception(
+                        f'[{llm_provider}] returned an invalid response: "{response}"'
+                    )
+            else:
+                raise Exception(f"[{llm_provider}] returned an empty response")
+
+        if adapter == "gemini":
+            from google import genai
+            from google.genai import types
+
+            http_options = types.HttpOptions(base_url=base_url) if base_url else None
+            generation_config = types.GenerateContentConfig(
+                temperature=0.5,
+                top_p=1,
+                top_k=1,
+                max_output_tokens=2048,
+                safety_settings=[
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_HARASSMENT",
+                        threshold="BLOCK_ONLY_HIGH",
+                    ),
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_HATE_SPEECH",
+                        threshold="BLOCK_ONLY_HIGH",
+                    ),
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        threshold="BLOCK_ONLY_HIGH",
+                    ),
+                    types.SafetySetting(
+                        category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                        threshold="BLOCK_ONLY_HIGH",
+                    ),
+                ],
+            )
+
+            try:
+                # 新版 google-genai 通过统一 Client 暴露模型服务。上下文管理器
+                # 会在请求结束后关闭底层 HTTP 连接，避免频繁生成时积累连接资源。
+                with genai.Client(
+                    api_key=api_key,
+                    http_options=http_options,
+                ) as client:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                        config=generation_config,
+                    )
+                generated_text = response.text
+            except (AttributeError, IndexError, ValueError) as e:
+                logger.warning(f"gemini returned invalid response content: {str(e)}")
+                raise ValueError(f"[{llm_provider}] returned invalid response content")
+
+            return _normalize_text_response(generated_text, llm_provider)
+
+        if adapter == "cloudflare_ai_gateway":
+            account_id = extra_values["account_id"]
+            gateway_id = extra_values["gateway_id"]
+            # Cloudflare 当前推荐的 AI Gateway REST API 兼容 OpenAI SDK。
+            # Account ID 用于构造统一端点，Gateway ID 通过请求头选择；这里
+            # 不再调用 Workers AI 的 /ai/run/{model} 专用接口。
+            client = sdk_client = OpenAI(
+                api_key=api_key,
+                base_url=(
+                    f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+                ),
+                default_headers={"cf-aig-gateway-id": gateway_id},
+            )
+            response = client.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
             )
-        else:
-            api_version = ""  # for azure
-            if llm_provider == "moonshot":
-                api_key = config.app.get("moonshot_api_key")
-                model_name = config.app.get("moonshot_model_name")
-                base_url = "https://api.moonshot.cn/v1"
-            elif llm_provider == "ollama":
-                # api_key = config.app.get("openai_api_key")
-                api_key = "ollama"  # any string works but you are required to have one
-                model_name = config.app.get("ollama_model_name")
-                base_url = config.app.get("ollama_base_url", "")
-                if not base_url:
-                    base_url = config.get_default_ollama_base_url()
-            elif llm_provider == "openai":
-                api_key = config.app.get("openai_api_key")
-                model_name = config.app.get("openai_model_name")
-                base_url = config.app.get("openai_base_url", "")
-                if not base_url:
-                    base_url = "https://api.openai.com/v1"
-            elif llm_provider == "aihubmix":
-                api_key = config.app.get("aihubmix_api_key")
-                model_name = config.app.get("aihubmix_model_name")
-                base_url = config.app.get("aihubmix_base_url", "")
-                # AIHubMix 兼容 OpenAI Chat Completions 协议。这里使用独立
-                # provider 保存合作方的默认网关和推荐模型，避免把推广链接、
-                # 默认模型等合作配置混进普通 OpenAI provider，影响现有用户。
-                if not base_url:
-                    base_url = "https://aihubmix.com/v1"
-                if not model_name:
-                    model_name = "gpt-5.4-mini"
-            elif llm_provider == "aimlapi":
-                api_key = config.app.get("aimlapi_api_key")
-                model_name = config.app.get("aimlapi_model_name")
-                base_url = config.app.get("aimlapi_base_url", "")
-                if not base_url:
-                    base_url = "https://api.aimlapi.com/v1"
-                if not model_name:
-                    model_name = "openai/gpt-4o-mini"
-            elif llm_provider == "oneapi":
-                api_key = config.app.get("oneapi_api_key")
-                model_name = config.app.get("oneapi_model_name")
-                base_url = config.app.get("oneapi_base_url", "")
-            elif llm_provider == "azure":
-                api_key = config.app.get("azure_api_key")
-                model_name = config.app.get("azure_model_name")
-                base_url = config.app.get("azure_base_url", "")
-                api_version = config.app.get("azure_api_version", "2024-02-15-preview")
-            elif llm_provider == "gemini":
-                api_key = config.app.get("gemini_api_key")
-                model_name = config.app.get("gemini_model_name")
-                base_url = config.app.get("gemini_base_url", "")
-                # Gemini 旧模型名已经陆续下线，这里自动兼容历史配置，
-                # 避免用户沿用旧值时直接收到 404。
-                if not model_name:
-                    model_name = _DEFAULT_GEMINI_MODEL
-                elif model_name in _DEPRECATED_GEMINI_MODELS:
-                    logger.warning(
-                        f"gemini model '{model_name}' is deprecated, fallback to '{_DEFAULT_GEMINI_MODEL}'"
-                    )
-                    model_name = _DEFAULT_GEMINI_MODEL
-            elif llm_provider == "grok":
-                api_key = config.app.get("grok_api_key")
-                model_name = config.app.get("grok_model_name")
-                base_url = config.app.get("grok_base_url", "")
-                if not base_url:
-                    base_url = "https://api.x.ai/v1"
-            elif llm_provider == "groq":
-                api_key = config.app.get("groq_api_key")
-                model_name = config.app.get("groq_model_name")
-                if not model_name:
-                    model_name = "llama-3.3-70b-versatile"
-                base_url = config.app.get("groq_base_url", "")
-                if not base_url:
-                    base_url = "https://api.groq.com/openai/v1"
-            elif llm_provider == "qwen":
-                api_key = config.app.get("qwen_api_key")
-                model_name = config.app.get("qwen_model_name")
-                base_url = "***"
-            elif llm_provider == "cloudflare":
-                api_key = config.app.get("cloudflare_api_key")
-                model_name = config.app.get("cloudflare_model_name")
-                account_id = config.app.get("cloudflare_account_id")
-                base_url = "***"
-            elif llm_provider == "minimax":
-                api_key = config.app.get("minimax_api_key")
-                model_name = config.app.get("minimax_model_name")
-                base_url = config.app.get("minimax_base_url", "")
-                if not base_url:
-                    base_url = "https://api.minimax.io/v1"
-            elif llm_provider == "mimo":
-                api_key = config.app.get("mimo_api_key")
-                model_name = config.app.get("mimo_model_name")
-                base_url = config.app.get("mimo_base_url", "")
-                # Xiaomi MiMo 官方文档说明其兼容 OpenAI Chat Completions 协议。
-                # 这里使用独立 provider 保存默认地址和模型名，用户不用把 MiMo
-                # 当作 OpenAI 自定义 base_url 配置，也便于后续继续接入 MiMo
-                # 多模态或 TTS 能力时保持边界清晰。
-                if not base_url:
-                    base_url = "https://api.xiaomimimo.com/v1"
-                if not model_name:
-                    model_name = "mimo-v2.5-pro"
-            elif llm_provider == "deepseek":
-                api_key = config.app.get("deepseek_api_key")
-                model_name = config.app.get("deepseek_model_name")
-                base_url = config.app.get("deepseek_base_url")
-                if not base_url:
-                    base_url = "https://api.deepseek.com"
-            elif llm_provider == "modelscope":
-                api_key = config.app.get("modelscope_api_key")
-                model_name = config.app.get("modelscope_model_name")
-                base_url = config.app.get("modelscope_base_url")
-                if not base_url:
-                    base_url = "https://api-inference.modelscope.cn/v1/"
-            elif llm_provider == "ernie":
-                api_key = config.app.get("ernie_api_key")
-                secret_key = config.app.get("ernie_secret_key")
-                base_url = config.app.get("ernie_base_url")
-                model_name = "***"
-                if not secret_key:
-                    raise ValueError(
-                        f"{llm_provider}: secret_key is not set, please set it in the config.toml file."
-                    )
-            elif llm_provider == "pollinations":
-                try:
-                    base_url = config.app.get("pollinations_base_url", "")
-                    if not base_url:
-                        base_url = "https://text.pollinations.ai/openai"
-                    model_name = config.app.get("pollinations_model_name", "openai-fast")
-                   
-                    # Prepare the payload
-                    payload = {
-                        "model": model_name,
-                        "messages": [
-                            {"role": "user", "content": prompt}
-                        ],
-                        "seed": 101  # Optional but helps with reproducibility
-                    }
-                    
-                    # Optional parameters if configured
-                    if config.app.get("pollinations_private"):
-                        payload["private"] = True
-                    if config.app.get("pollinations_referrer"):
-                        payload["referrer"] = config.app.get("pollinations_referrer")
-                    
-                    headers = {
-                        "Content-Type": "application/json"
-                    }
-                    
-                    # Make the API request
-                    response = requests.post(base_url, headers=headers, json=payload)
-                    response.raise_for_status()
-                    result = response.json()
-                    
-                    if result and "choices" in result and len(result["choices"]) > 0:
-                        content = result["choices"][0]["message"]["content"]
-                        return _normalize_text_response(content, llm_provider)
-                    else:
-                        raise Exception(f"[{llm_provider}] returned an invalid response format")
-                        
-                except requests.exceptions.RequestException as e:
-                    raise Exception(f"[{llm_provider}] request failed: {str(e)}")
-                except Exception as e:
-                    raise Exception(f"[{llm_provider}] error: {str(e)}")
+            return _extract_chat_completion_text(response, llm_provider)
 
-            elif llm_provider == "litellm":
-                model_name = config.app.get("litellm_model_name")
+        if adapter == "litellm":
+            import litellm
 
-            if llm_provider not in ["pollinations", "ollama", "litellm"]:  # Skip validation for providers that don't require API key
-                if not api_key:
-                    raise ValueError(
-                        f"{llm_provider}: api_key is not set, please set it in the config.toml file."
-                    )
-                if not model_name:
-                    raise ValueError(
-                        f"{llm_provider}: model_name is not set, please set it in the config.toml file."
-                    )
-                if not base_url and llm_provider not in ["gemini"]:
-                    raise ValueError(
-                        f"{llm_provider}: base_url is not set, please set it in the config.toml file."
-                    )
-
-            if llm_provider == "qwen":
-                import dashscope
-                from dashscope.api_entities.dashscope_response import GenerationResponse
-
-                dashscope.api_key = api_key
-                response = dashscope.Generation.call(
-                    model=model_name, messages=[{"role": "user", "content": prompt}]
-                )
-                if response:
-                    if isinstance(response, GenerationResponse):
-                        status_code = response.status_code
-                        if status_code != 200:
-                            raise Exception(
-                                f'[{llm_provider}] returned an error response: "{response}"'
-                            )
-
-                        return _extract_qwen_generation_text(response)
-                    else:
-                        raise Exception(
-                            f'[{llm_provider}] returned an invalid response: "{response}"'
-                        )
-                else:
-                    raise Exception(f"[{llm_provider}] returned an empty response")
-
-            if llm_provider == "gemini":
-                import google.generativeai as genai
-
-                if not base_url:
-                    genai.configure(api_key=api_key, transport="rest")
-                else:
-                    genai.configure(api_key=api_key, transport="rest", client_options={'api_endpoint': base_url})
-
-                generation_config = {
-                    "temperature": 0.5,
-                    "top_p": 1,
-                    "top_k": 1,
-                    "max_output_tokens": 2048,
-                }
-
-                safety_settings = [
-                    {
-                        "category": "HARM_CATEGORY_HARASSMENT",
-                        "threshold": "BLOCK_ONLY_HIGH",
-                    },
-                    {
-                        "category": "HARM_CATEGORY_HATE_SPEECH",
-                        "threshold": "BLOCK_ONLY_HIGH",
-                    },
-                    {
-                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                        "threshold": "BLOCK_ONLY_HIGH",
-                    },
-                    {
-                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                        "threshold": "BLOCK_ONLY_HIGH",
-                    },
-                ]
-
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    generation_config=generation_config,
-                    safety_settings=safety_settings,
+            if not model_name:
+                raise ValueError(
+                    f"{llm_provider}: model_name is not set, please set it in the config.toml file."
                 )
 
-                try:
-                    response = model.generate_content(prompt)
-                    candidates = response.candidates
-                    generated_text = candidates[0].content.parts[0].text
-                except (AttributeError, IndexError) as e:
-                    logger.warning(
-                        f"gemini returned invalid response content: {str(e)}"
-                    )
-                    raise ValueError(
-                        f"[{llm_provider}] returned invalid response content"
-                    )
+            response = litellm.completion(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                drop_params=True,
+            )
 
-                return _normalize_text_response(generated_text, llm_provider)
+            if not response:
+                raise ValueError(f"[{llm_provider}] returned empty response")
+            if not getattr(response, "choices", None):
+                raise ValueError(f"[{llm_provider}] returned empty response")
 
-            if llm_provider == "cloudflare":
-                response = requests.post(
-                    f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model_name}",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "You are a friendly assistant",
-                            },
-                            {"role": "user", "content": prompt},
-                        ]
-                    },
-                )
-                result = response.json()
-                logger.info(result)
-                return _normalize_text_response(result["result"]["response"], llm_provider)
+            return _extract_chat_completion_text(response, llm_provider)
 
-            if llm_provider == "ernie":
-                response = requests.post(
-                    "https://aip.baidubce.com/oauth/2.0/token", 
-                    params={
-                        "grant_type": "client_credentials",
-                        "client_id": api_key,
-                        "client_secret": secret_key,
-                    }
-                )
-                access_token = response.json().get("access_token")
-                url = f"{base_url}?access_token={access_token}"
-
-                payload = json.dumps(
-                    {
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.5,
-                        "top_p": 0.8,
-                        "penalty_score": 1,
-                        "disable_search": False,
-                        "enable_citation": False,
-                        "response_format": "text",
-                    }
-                )
-                headers = {"Content-Type": "application/json"}
-
-                response = requests.request(
-                    "POST", url, headers=headers, data=payload
-                ).json()
-                return _normalize_text_response(response.get("result"), llm_provider)
-
-            if llm_provider == "litellm":
-                import litellm
-
-                if not model_name:
-                    raise ValueError(
-                        f"{llm_provider}: model_name is not set, please set it in the config.toml file."
-                    )
-
-                response = litellm.completion(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    drop_params=True,
-                )
-
-                if not response:
-                    raise ValueError(f"[{llm_provider}] returned empty response")
-                if not getattr(response, "choices", None):
-                    raise ValueError(f"[{llm_provider}] returned empty response")
-
-                return _extract_chat_completion_text(response, llm_provider)
-
-            if llm_provider == "azure":
-                # Azure OpenAI SDK 使用 `azure_endpoint` 和 `api_version` 生成专用请求地址，
-                # 不能继续复用下面普通 OpenAI-compatible 的 `base_url` 初始化逻辑。
-                # 这里在 Azure 分支内完成请求并立即返回，避免客户端被后续 fallback
-                # 覆盖，导致用户配置的 Azure 凭证通过校验但实际请求没有被使用。
-                logger.info(f"requesting azure chat completion, model: {model_name}")
-                client = AzureOpenAI(
-                    api_key=api_key,
-                    api_version=api_version,
-                    azure_endpoint=base_url,
-                )
-                response = client.chat.completions.create(
-                    model=model_name, messages=[{"role": "user", "content": prompt}]
-                )
-                if response:
-                    if isinstance(response, ChatCompletion):
-                        return _extract_chat_completion_text(response, llm_provider)
-                    else:
-                        raise Exception(
-                            f'[{llm_provider}] returned an invalid response: "{response}", please check your network '
-                            f"connection and try again."
-                        )
-                else:
-                    raise Exception(
-                        f"[{llm_provider}] returned an empty response, please check your network connection and try again."
-                    )
-
-            if llm_provider == "modelscope":
-                content = ''
-                client = OpenAI(
-                    api_key=api_key,
-                    base_url=base_url,
-                )
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    extra_body={"enable_thinking": False},
-                    stream=True
-                )
-                if response:
-                    for chunk in response:
-                        if not chunk.choices:
-                            continue
-                        delta = chunk.choices[0].delta
-                        if delta and delta.content:
-                            content += delta.content
-                    
-                    if not content.strip():
-                        raise ValueError("Empty content in stream response")
-                    
-                    return _normalize_text_response(content, llm_provider)
-                else:
-                    raise Exception(f"[{llm_provider}] returned an empty response")
-
-            else:
-                client = OpenAI(
-                    api_key=api_key,
-                    base_url=base_url,
-                )
-
+        if adapter == "azure":
+            # Azure OpenAI SDK 使用 `azure_endpoint` 和 `api_version` 生成专用请求地址，
+            # 不能继续复用下面普通 OpenAI-compatible 的 `base_url` 初始化逻辑。
+            # 这里在 Azure 分支内完成请求并立即返回，避免客户端被后续 fallback
+            # 覆盖，导致用户配置的 Azure 凭证通过校验但实际请求没有被使用。
+            logger.info(f"requesting azure chat completion, model: {model_name}")
+            client = sdk_client = AzureOpenAI(
+                api_key=api_key,
+                api_version=api_version,
+                azure_endpoint=base_url,
+            )
             response = client.chat.completions.create(
                 model=model_name, messages=[{"role": "user", "content": prompt}]
             )
@@ -560,9 +478,214 @@ def _generate_response(prompt: str) -> str:
                     f"[{llm_provider}] returned an empty response, please check your network connection and try again."
                 )
 
-        return _normalize_text_response(content, llm_provider)
+        if adapter == "claude_code":
+            # Claude 订阅（Pro / Max / Team）不签发 API Key，其凭证只能由
+            # Claude Code 官方客户端自己使用。这里不直接请求 Anthropic API，
+            # 而是以 headless 模式调用本机已登录的 claude CLI（`claude -p`），
+            # 由 CLI 完成鉴权，脚本生成只消费它返回的文本。
+            configured_cli = (extra_values.get("cli_path") or "").strip() or "claude"
+            cli_path = shutil.which(configured_cli)
+            if not cli_path and os.path.isfile(configured_cli):
+                cli_path = configured_cli
+            if not cli_path:
+                raise ValueError(
+                    f"{llm_provider}: claude CLI not found ('{configured_cli}'), "
+                    f"install it in the runtime or set "
+                    f"{provider.config_key('cli_path')} in the config.toml file."
+                )
+
+            try:
+                timeout_seconds = coerce_claude_code_timeout(
+                    extra_values.get("timeout"), provider.config_key("timeout")
+                )
+            except ValueError as timeout_error:
+                raise ValueError(f"{llm_provider}: {timeout_error}") from None
+
+            # prompt 通过 stdin 传入，不放在命令行里：Windows 上 npm 安装的
+            # claude 是 claude.cmd，cmd.exe 会在第一个换行处截断参数，多行
+            # prompt 和其后的隔离参数都会丢失。
+            command = [
+                cli_path,
+                "-p",
+                "--output-format",
+                "json",
+                "--system-prompt",
+                CLAUDE_CODE_SYSTEM_PROMPT,
+                # 关闭全部内置工具，保证只做文本生成。
+                "--tools",
+                "",
+                # 关闭 CLAUDE.md、skills、hooks、plugins、MCP 等用户级定制；
+                # 鉴权与模型选择不受影响（不能用 --bare，它会禁用 OAuth）。
+                "--safe-mode",
+            ]
+            # 模型名留空时沿用 CLI 自己的默认模型，避免这里硬编码的模型 ID
+            # 随订阅可用模型变化而失效。
+            if model_name:
+                command += ["--model", model_name]
+
+            cli_env, removed_env = build_claude_code_env()
+            if removed_env:
+                # 只记录变量名，不记录取值，避免把密钥写进日志。
+                logger.warning(
+                    f"{llm_provider}: ignoring conflicting environment variables "
+                    f"so the subscription login is used: {', '.join(removed_env)}"
+                )
+
+            logger.info(f"invoking claude cli, model: {model_name or 'cli default'}")
+            # CLI 会读取工作目录下的 CLAUDE.md 和项目设置，这些内容会污染
+            # 文案结果，因此固定在一个临时空目录中执行。
+            with tempfile.TemporaryDirectory() as work_dir:
+                try:
+                    completed = subprocess.run(
+                        command,
+                        input=prompt,
+                        capture_output=True,
+                        text=True,
+                        # The CLI always emits UTF-8. Without an explicit encoding,
+                        # text=True decodes with the system locale (e.g. cp1252 on
+                        # non-English Windows), so every non-ASCII character reaches
+                        # the script as mojibake.
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout_seconds,
+                        cwd=work_dir,
+                        env=cli_env,
+                    )
+                except subprocess.TimeoutExpired:
+                    raise Exception(
+                        f"[{llm_provider}] claude cli timed out after "
+                        f"{timeout_seconds:.0f}s"
+                    )
+
+            # 未登录、用量耗尽这类失败同样会返回 JSON（`is_error` 为真，
+            # `result` 是可读原因），只是退出码非 0。因此先解析 stdout，
+            # 只有在拿不到 JSON 时才回退到退出码和 stderr。
+            stdout = (completed.stdout or "").strip()
+            try:
+                payload = json.loads(stdout) if stdout else None
+            except json.JSONDecodeError:
+                payload = None
+
+            if payload is None:
+                detail = (completed.stderr or stdout or "").strip()
+                if "unknown option" in detail.lower():
+                    raise Exception(
+                        f"[{llm_provider}] the installed claude CLI does not support "
+                        f"the required isolation flags; upgrade to "
+                        f"{CLAUDE_CODE_MIN_CLI_VERSION} or newer: {detail[:300]}"
+                    )
+                if completed.returncode != 0:
+                    raise Exception(
+                        f"[{llm_provider}] claude cli exited with code "
+                        f"{completed.returncode}: {detail[:500]}"
+                    )
+                raise Exception(
+                    f'[{llm_provider}] returned an invalid response: "{detail[:500]}"'
+                )
+
+            if payload.get("is_error") or completed.returncode != 0:
+                reason = str(payload.get("result") or "").strip() or (
+                    f"claude cli exited with code {completed.returncode}"
+                )
+                # 容器里无法执行交互式 /login，这里直接给出可用的鉴权方式。
+                if "login" in reason.lower():
+                    reason += (
+                        " (run `claude setup-token` on the host and pass the token "
+                        "to the container as CLAUDE_CODE_OAUTH_TOKEN)"
+                    )
+                raise Exception(
+                    f'[{llm_provider}] returned an error response: "{reason[:500]}"'
+                )
+
+            return _normalize_text_response(payload.get("result"), llm_provider)
+
+        if adapter == "modelscope":
+            content = ""
+            client = sdk_client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+            )
+            response = sdk_stream = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                extra_body={"enable_thinking": False},
+                stream=True,
+            )
+            if response:
+                for chunk in response:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    if delta and delta.content:
+                        content += delta.content
+
+                if not content.strip():
+                    raise ValueError("Empty content in stream response")
+
+                return _normalize_text_response(content, llm_provider)
+            else:
+                raise Exception(f"[{llm_provider}] returned an empty response")
+
+        client = sdk_client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+        )
+
+        response = client.chat.completions.create(
+            model=model_name, messages=[{"role": "user", "content": prompt}]
+        )
+        if response:
+            if isinstance(response, ChatCompletion):
+                return _extract_chat_completion_text(response, llm_provider)
+            else:
+                raise Exception(
+                    f'[{llm_provider}] returned an invalid response: "{response}", please check your network '
+                    f"connection and try again."
+                )
+        else:
+            raise Exception(
+                f"[{llm_provider}] returned an empty response, please check your network connection and try again."
+            )
+
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"Error: {_sanitize_error_message(e)}"
+
+    finally:
+        for resource in (sdk_stream, sdk_client):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        f"could not close LLM transport: {type(cleanup_error).__name__}"
+                    )
+
+
+def test_connection() -> tuple[bool, str, float]:
+    """
+    使用当前 Provider 配置发起一次最小请求，验证实际生成链路是否可用。
+
+    连接测试直接复用 `_generate_response()`，因此会覆盖 API Key、Base URL、
+    模型名称和 Provider 专用字段，但不会进入脚本生成的重试逻辑，也不会发送
+    用户的视频主题或文案。返回值依次为成功状态、错误信息和请求耗时。
+    """
+    started_at = perf_counter()
+    response = _generate_response(prompt="Reply with exactly: OK")
+    elapsed = perf_counter() - started_at
+
+    if not response:
+        error_message = "LLM returned an empty response"
+        logger.warning(f"llm connection test failed: {error_message}")
+        return False, error_message, elapsed
+
+    if response.startswith("Error:"):
+        error_message = response.removeprefix("Error:").strip()
+        logger.warning(f"llm connection test failed: {error_message}")
+        return False, error_message, elapsed
+
+    logger.info(f"llm connection test succeeded, elapsed: {elapsed:.2f}s")
+    return True, "", elapsed
 
 
 def _limit_script_text(text: str | None, max_length: int, field_name: str) -> str:
@@ -589,8 +712,7 @@ def _normalize_script_paragraph_number(paragraph_number: int | None) -> int:
         # WebUI 和 API 都会限制范围；这里兜底处理内部调用，避免异常参数直接扩大
         # LLM 生成成本或生成空结果。
         logger.warning(
-            "script paragraph_number is out of range and will be clamped: "
-            f"{value}"
+            f"script paragraph_number is out of range and will be clamped: {value}"
         )
         return max(MIN_SCRIPT_PARAGRAPH_NUMBER, min(value, MAX_SCRIPT_PARAGRAPH_NUMBER))
 
@@ -640,6 +762,7 @@ def generate_script(
     paragraph_number: int = 1,
     video_script_prompt: str = "",
     custom_system_prompt: str = "",
+    app_config=None,
 ) -> str:
     paragraph_number = _normalize_script_paragraph_number(paragraph_number)
     video_script_prompt = _limit_script_text(
@@ -669,9 +792,11 @@ def generate_script(
         response = response.replace("*", "")
         response = response.replace("#", "")
 
-        # Remove markdown syntax
-        response = re.sub(r"\[.*\]", "", response)
-        response = re.sub(r"\(.*\)", "", response)
+        # Remove markdown syntax.  Use non-greedy .*? so each bracket/paren
+        # group is removed independently; the greedy form would eat all text
+        # between the first opener and the last closer on the same line.
+        response = re.sub(r"\[.*?\]", "", response)
+        response = re.sub(r"\(.*?\)", "", response)
 
         # Split the script into paragraphs
         paragraphs = response.split("\n\n")
@@ -684,25 +809,34 @@ def generate_script(
 
     for i in range(_max_retries):
         try:
-            response = _generate_response(prompt=prompt)
+            if app_config is None:
+                response = _generate_response(prompt=prompt)
+            else:
+                response = _generate_response(prompt=prompt, app_config=app_config)
+            if isinstance(response, str) and response.startswith("Error: "):
+                # _generate_response returns provider failures as text. Passing
+                # that text through would make the task treat it as narration.
+                raise ValueError(response)
             if response:
-                final_script = format_response(response)
+                candidate = format_response(response)
             else:
                 logging.error("gpt returned an empty response")
+                candidate = ""
 
-            # g4f may return an error message
-            if final_script and "当日额度已消耗完" in final_script:
-                raise ValueError(final_script)
+            # Some upstream providers may return quota errors as plain text.
+            if candidate and "当日额度已消耗完" in candidate:
+                raise ValueError(candidate)
 
-            if final_script:
+            if candidate:
+                final_script = candidate
                 break
         except Exception as e:
             logger.error(f"failed to generate script: {e}")
 
-        if i < _max_retries:
+        if i < _max_retries - 1:
             logger.warning(f"failed to generate video script, trying again... {i + 1}")
-    if "Error: " in final_script:
-        logger.error(f"failed to generate video script: {final_script}")
+    if not final_script:
+        logger.error("failed to generate video script after retries")
     else:
         logger.success(f"completed: \n{final_script}")
     return final_script.strip()
@@ -729,7 +863,9 @@ def generate_terms(
     video_script: str,
     amount: int = 5,
     match_script_order: bool = False,
+    app_config=None,
 ) -> List[str]:
+    video_script = utils.remove_pause_tags(video_script or "").strip()
     if match_script_order:
         goal = (
             f"Generate {amount} chronological stock-video search terms that follow "
@@ -743,10 +879,7 @@ def generate_terms(
         # 的 4 个示例误导，导致长文案只返回少量关键词，影响素材覆盖度。
         example_terms = [
             "opening visual topic",
-            *[
-                f"script visual topic {index}"
-                for index in range(2, max(amount, 1))
-            ],
+            *[f"script visual topic {index}" for index in range(2, max(amount, 1))],
             "final visual topic",
         ]
         output_example = json.dumps(example_terms[:amount], ensure_ascii=False)
@@ -788,25 +921,25 @@ def generate_terms(
 Please note that you must use English for generating video search terms; Chinese is not accepted.
 """.strip()
 
-    logger.info(
-        f"subject: {video_subject}, match_script_order: {match_script_order}"
-    )
+    logger.info(f"subject: {video_subject}, match_script_order: {match_script_order}")
 
     search_terms = []
     response = ""
     for i in range(_max_retries):
+        search_terms = []
         try:
-            response = _generate_response(prompt)
-            if "Error: " in response:
-                logger.error(f"failed to generate video script: {response}")
-                return response
+            if app_config is None:
+                response = _generate_response(prompt)
+            else:
+                response = _generate_response(prompt, app_config=app_config)
+            if response.startswith("Error: "):
+                # generate_terms 的公开返回类型是 List[str]。如果把 Provider 的
+                # 错误文案原样返回，下游只做空值判断时会把非空字符串误认为成功，
+                # 素材下载循环还会按字符遍历错误文案，产生无意义的外部请求。
+                # 这里统一返回空列表，让任务编排层在真实故障位置立即结束任务。
+                logger.error(f"failed to generate video terms: {response}")
+                return []
             search_terms = json.loads(_strip_code_fence(response))
-            if not isinstance(search_terms, list) or not all(
-                isinstance(term, str) for term in search_terms
-            ):
-                logger.error("response is not a list of strings.")
-                continue
-
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
             if response:
@@ -820,9 +953,17 @@ Please note that you must use English for generating video search terms; Chinese
                         # 是模型格式问题还是解析逻辑问题。
                         logger.warning(f"failed to generate video terms: {str(e)}")
 
+        # Apply the same contract to direct JSON and prose-wrapped recovery.
+        # Otherwise a nonempty array of numbers or objects reaches material search.
+        if not isinstance(search_terms, list) or not all(
+            isinstance(term, str) for term in search_terms
+        ):
+            logger.error("response is not a list of strings.")
+            search_terms = []
+
         if search_terms and len(search_terms) > 0:
             break
-        if i < _max_retries:
+        if i < _max_retries - 1:
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
 
     logger.success(f"completed: \n{search_terms}")
@@ -977,9 +1118,9 @@ Write engaging publishing metadata for a short video that will be posted on {lab
 ## Constraints
 1. Respond ONLY with a single valid minified JSON object. No markdown, no code fences, no commentary.
 2. The JSON must contain exactly these keys: "title", "caption", "hashtags".
-3. "title": a catchy hook, at most {spec['title_max']} characters.
-4. "caption": an engaging description that ends with a call to action, at most {spec['caption_max']} characters. Do not put hashtags inside the caption.
-5. "hashtags": a JSON array of exactly {spec['hashtag_count']} strings. Each must start with "#", contain no spaces, and be relevant to the topic and to {label}.
+3. "title": a catchy hook, at most {spec["title_max"]} characters.
+4. "caption": an engaging description that ends with a call to action, at most {spec["caption_max"]} characters. Do not put hashtags inside the caption.
+5. "hashtags": a JSON array of exactly {spec["hashtag_count"]} strings. Each must start with "#", contain no spaces, and be relevant to the topic and to {label}.
 6. {language_instruction}
 
 ## Output Example
@@ -1036,9 +1177,7 @@ def _fallback_social_metadata(
     return {
         "title": _clamp_text(title, spec["title_max"]),
         "caption": _clamp_text(script or subject, spec["caption_max"]),
-        "hashtags": _normalize_hashtags(
-            DEFAULT_SOCIAL_HASHTAGS, spec["hashtag_count"]
-        ),
+        "hashtags": _normalize_hashtags(DEFAULT_SOCIAL_HASHTAGS, spec["hashtag_count"]),
     }
 
 
@@ -1069,9 +1208,7 @@ def generate_social_metadata(
         language=language,
         platform=platform,
     )
-    logger.info(
-        f"generating social metadata: platform={platform}, language={language}"
-    )
+    logger.info(f"generating social metadata: platform={platform}, language={language}")
 
     response = ""
     for i in range(_max_retries):
@@ -1107,4 +1244,3 @@ if __name__ == "__main__":
     )
     print("######################")
     print(search_terms)
-    

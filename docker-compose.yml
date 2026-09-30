@@ -14,6 +14,9 @@ services:
       - --server.enableCORS=false
       - --server.enableXsrfProtection=false
       - --browser.gatherUsageStats=false
+      - --client.toolbarMode=minimal
+      - --logger.hideWelcomeMessage=True
+      - --server.showEmailPrompt=False
     restart: always
     networks:
       - coolify
