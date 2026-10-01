@@ -1,5 +1,5 @@
 # Use an official Python runtime as a parent image
-FROM python:3.11-slim-bullseye
+FROM python:3.11-slim-bookworm
 
 # Set the working directory in the container
 WORKDIR /MoneyPrinterTurbo
@@ -14,73 +14,13 @@ ENV PYTHONPATH="/MoneyPrinterTurbo"
 ARG DOCKER_BUILD_MIRROR=default
 ARG PIP_USE_OFFICIAL=1
 
-# Sistema de instalacao de dependencias resiliente com suporte a mirrors e fallback oficial:
-RUN set -u; \
-    cp /etc/apt/sources.list /etc/apt/sources.list.official 2>/dev/null || true; \
-    write_debian_sources() { \
-        main_url="$1"; \
-        security_url="$2"; \
-        printf 'deb %s bullseye main\ndeb %s bullseye-updates main\ndeb %s bullseye-security main\n' \
-            "$main_url" "$main_url" "$security_url" > /etc/apt/sources.list; \
-        rm -rf /var/lib/apt/lists/*; \
-    }; \
-    install_system_dependencies() { \
-        apt-get update && \
-        apt-get install -y --no-install-recommends git ffmpeg; \
-    }; \
-    retry_system_dependencies() { \
-        attempt=1; \
-        while [ "$attempt" -le 3 ]; do \
-            echo "Attempt $attempt: installing system dependencies"; \
-            if install_system_dependencies; then \
-                return 0; \
-            fi; \
-            echo "Attempt $attempt failed" >&2; \
-            if [ "$attempt" -lt 3 ]; then \
-                echo "Retrying in 5 seconds..." >&2; \
-                sleep 5; \
-            fi; \
-            attempt=$((attempt + 1)); \
-        done; \
-        return 1; \
-    }; \
+# Instalação de dependências do sistema (git e ffmpeg) de forma limpa e resiliente
+RUN set -eux; \
     if [ "$DOCKER_BUILD_MIRROR" = "china" ]; then \
-        write_debian_sources \
-            "https://mirrors.aliyun.com/debian" \
-            "https://mirrors.aliyun.com/debian-security"; \
-        if ! retry_system_dependencies; then \
-            echo "Aliyun mirror failed, switching to Tsinghua mirror" >&2; \
-            write_debian_sources \
-                "https://mirrors.tuna.tsinghua.edu.cn/debian" \
-                "https://mirrors.tuna.tsinghua.edu.cn/debian-security"; \
-            if ! install_system_dependencies; then \
-                echo "Tsinghua mirror failed, switching to default Debian mirror" >&2; \
-                write_debian_sources \
-                    "https://deb.debian.org/debian" \
-                    "https://security.debian.org/debian-security"; \
-                if ! install_system_dependencies; then \
-                    echo "Trying official image sources" >&2; \
-                    cp /etc/apt/sources.list.official /etc/apt/sources.list 2>/dev/null || true; \
-                    if ! install_system_dependencies; then \
-                        echo "Failed to install system dependencies from all configured mirrors" >&2; \
-                        exit 1; \
-                    fi; \
-                fi; \
-            fi; \
-        fi; \
-    else \
-        echo "Using default official Debian mirrors"; \
-        if ! retry_system_dependencies; then \
-            echo "Retrying with explicit security mirror" >&2; \
-            write_debian_sources \
-                "https://deb.debian.org/debian" \
-                "https://security.debian.org/debian-security"; \
-            if ! retry_system_dependencies; then \
-                echo "Failed to install system dependencies from the default Debian mirror" >&2; \
-                exit 1; \
-            fi; \
-        fi; \
+        sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
     fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends git ffmpeg; \
     rm -rf /var/lib/apt/lists/*
 
 # Copy only the requirements.txt first to leverage Docker cache
