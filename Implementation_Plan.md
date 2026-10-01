@@ -62,9 +62,10 @@ Este documento detalha o planejamento para atualizar o fork do **MoneyPrinterTur
    - [x] Criado PR #1 no GitHub e executado merge com integracao no `main` (commit `210607b`).
    - [x] Push realizado com sucesso para `origin/main`.
 6. **Deploy no Coolify**:
-   - [x] Enfileirado deploy da versao atualizada via MCP Coolify (Deployment UUID: `iosv0zcuen5dgfqp7nsfxsbe`).
-   - [ ] Validacao dos smoke checks pos-deploy (WebUI e API).
+   - [x] Enfileirado deploy da versao atualizada via MCP Coolify (Deployment inicial `iosv0zcuen5dgfqp7nsfxsbe` -> correcao de imagem base Debian Bookworm em commit `d779fe1` -> deploy final `qhubcekipanedmvc3xnon74f` concluido com status `finished`).
+   - [x] Validacao dos smoke checks pos-deploy (WebUI e API retornando HTTP 200 OK, validacao visual no browser confirmada).
 7. **Finalizacao e Documentacao**:
-   - [x] `LOG_DESENVOLVIMENTO.md` atualizado.
-   - [x] `Implementation_Plan.md` atualizado.
-   - [x] `DOCUMENTACAO.md` atualizado.
+   - [x] `LOG_DESENVOLVIMENTO.md` atualizado e sincronizado.
+   - [x] `Implementation_Plan.md` atualizado e sincronizado.
+   - [x] `DOCUMENTACAO.md` atualizado e sincronizado.
+

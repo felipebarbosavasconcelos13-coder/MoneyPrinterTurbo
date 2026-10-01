@@ -26,10 +26,29 @@ Este arquivo registra alteracoes relevantes feitas no projeto **MoneyPrinterTurb
 - Merge executado e integrado no branch `main` com o commit `210607be378905fb197e36482170460e59548ec2`.
 - Push realizado com sucesso para `origin/main`.
 
-### 5. Deploy no Coolify
-- Disparado deploy com reconstrucao forçada (`force: true`) para a aplicacao `money-printer-turbo:completo` (UUID: `pn25p4iuncprsq6g5bnj3m84`).
-- Deployment UUID: `iosv0zcuen5dgfqp7nsfxsbe`.
-- BuildKit em execucao compilando as imagens do `docker-compose.yml` (servicos `webui` e `api`).
+### 5. Deploy no Coolify e Ajuste de Imagem Base
+- Primeiro deploy `iosv0zcuen5dgfqp7nsfxsbe` identificou falha de fontes do Debian Bullseye (que chegou ao EOL oficial em 31/08/2026).
+- Corrigida a imagem base no `Dockerfile` para `python:3.11-slim-bookworm` (Debian 12 com suporte LTS ativo até 2028), simplificando a instalação de `git` e `ffmpeg` e definindo os mirrors oficiais como padrão para builds globais (`DOCKER_BUILD_MIRROR=default`, `PIP_USE_OFFICIAL=1`).
+- Commit `d779fe1`: `fix(docker): switch base image to python:3.11-slim-bookworm for active Debian support`.
+- Disparado novo deploy com reconstrução forçada (`qhubcekipanedmvc3xnon74f`).
+- **Status Final**: `finished` (concluído com sucesso absoluto).
+- Containers criados e iniciados:
+  - `pn25p4iuncprsq6g5bnj3m84-webui-1`: Started
+  - `pn25p4iuncprsq6g5bnj3m84-api-1`: Started
+
+### 6. Smoke Checks em Producao (100% OK)
+- WebUI:
+  - `https://moneyprinterturbo.genialsolucoesdigitais.com.br/` -> `HTTP 200`
+- API Docs:
+  - `https://api-moneyprinterturbo.genialsolucoesdigitais.com.br/docs` -> `HTTP 200`
+- API OpenAPI:
+  - `https://api-moneyprinterturbo.genialsolucoesdigitais.com.br/openapi.json` -> `HTTP 200` (versao `v1.3.7`, `paragraph_number` máximo `25` confirmado)
+- Health Check Ping:
+  - `https://api-moneyprinterturbo.genialsolucoesdigitais.com.br/ping` -> `HTTP 200`
+- File Storage Persistente:
+  - Montado em `/MoneyPrinterTurbo` (UUID: `ypo7k7jzl3ndm4o0s2oqca9y`) preservado intacto.
+- Validacao Visual via Browser Subagent:
+  - Interface Streamlit carregada perfeitamente na versão `v1.3.7`, em português, com todos os controles de roteiro, vídeo, áudio, legendas e configurações funcionais.
 
 ## [30/09/2026] - Auditoria Geral e Plano de Atualizacao para o Upstream Mais Recente
 
