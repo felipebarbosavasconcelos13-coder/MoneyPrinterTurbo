@@ -20,6 +20,10 @@ services:
       - --client.toolbarMode=minimal
       - --logger.hideWelcomeMessage=True
       - --server.showEmailPrompt=False
+    volumes:
+      - /data/restauracao/moneyprinterturbo/config.toml:/MoneyPrinterTurbo/config.toml
+      - /data/restauracao/moneyprinterturbo/storage:/MoneyPrinterTurbo/storage
+    mem_limit: 2g
     restart: always
     networks:
       - coolify
@@ -31,6 +35,9 @@ services:
       - "traefik.http.routers.moneyprinterturbo-webui.tls=true"
       - "traefik.http.routers.moneyprinterturbo-webui.tls.certresolver=letsencrypt"
       - "traefik.http.routers.moneyprinterturbo-webui.service=moneyprinterturbo-webui"
+      - "traefik.http.routers.moneyprinterturbo-webui.middlewares=moneyprinterturbo-login"
+      - "traefik.http.middlewares.moneyprinterturbo-login.basicauth.users=${MPT_WEBUI_AUTH:?Configure a autenticacao da WebUI}"
+      - "traefik.http.middlewares.moneyprinterturbo-login.basicauth.removeheader=true"
       - "traefik.http.services.moneyprinterturbo-webui.loadbalancer.server.port=8501"
 
   api:
@@ -45,6 +52,10 @@ services:
     command:
       - python3
       - main.py
+    volumes:
+      - /data/restauracao/moneyprinterturbo/config.toml:/MoneyPrinterTurbo/config.toml
+      - /data/restauracao/moneyprinterturbo/storage:/MoneyPrinterTurbo/storage
+    mem_limit: 2g
     restart: always
     networks:
       - coolify

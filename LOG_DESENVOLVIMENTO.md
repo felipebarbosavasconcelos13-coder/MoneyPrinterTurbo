@@ -1,5 +1,13 @@
 # Log de Desenvolvimento
 
+## [14/10/2026] — Preparacao da restauracao apos reinstalacao da VPS
+
+- Origem local e GitHub no mesmo commit 9e7d1988a1b19728af37d729ca1e909270a776f9. Configuracao local privada disponivel, Redis desativado como encontrado.
+- Compose original aprovado por docker compose config --quiet na VPS, sem inicializacao de servicos. Adicionados mounts compartilhados de config.toml/storage, limite de memoria e Basic Auth da WebUI por variavel do Coolify; mantidos routers e rede coolify.
+- Planejada ativacao de app.api_key somente na copia de producao e armazenamento privado das credenciais. Configuracao local nao alterada.
+- Deploy, testes de acesso e verificacao da persistencia ainda pendentes nesta entrada. Nao foram restaurados videos, acessadas outras VPS nem modificados backups do Google Drive.
+
+
 Este arquivo registra alteracoes relevantes feitas no projeto **MoneyPrinterTurbo**, com foco em manutencao, deploy e decisoes operacionais.
 
 ## [30/09/2026] - Atualizacao Completa para o Upstream mais recente e Deploy no Coolify
