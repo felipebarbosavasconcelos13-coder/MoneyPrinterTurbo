@@ -1,5 +1,17 @@
 # Plano de Implementacao - Atualizacao para o Upstream Mais Recente
 
+## Restauracao em 14/10/2026 — andamento atual
+
+- [x] Fonte local e GitHub conferidas no commit 9e7d1988a1b19728af37d729ca1e909270a776f9.
+- [x] Compose original validado sem iniciar containers.
+- [x] Persistencia de config.toml/storage e autenticacao de proxy preparadas.
+- [ ] Aplicar a configuracao privada e cadastrar o novo recurso no Coolify.
+- [ ] Confirmar build, WebUI autenticada, API e persistencia por SSH.
+- [ ] Confirmar integracoes externas sem gerar videos ou consumir provedores pagos para teste.
+
+Os itens de setembro abaixo sao historicos da VPS anterior. O storage antigo montado sobre a aplicacao inteira nao existe na VPS reinstalada e nao sera tratado como restaurado.
+
+
 Este documento detalha o planejamento para atualizar o fork do **MoneyPrinterTurbo** para o commit mais recente do repositório original upstream, preservando todas as customizacoes e a infraestrutura de deploy no Coolify.
 
 ---

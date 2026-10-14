@@ -1,5 +1,10 @@
 # Documentacao do Projeto - MoneyPrinterTurbo
 
+## Restauracao em 14/10/2026 — em andamento
+
+A VPS anterior foi reinstalada. Os UUIDs e resultados de setembro abaixo descrevem o ambiente antigo, nao comprovam a instalacao atual. Restauracao preparada a partir do commit 9e7d1988a1b19728af37d729ca1e909270a776f9. O Compose mantem WebUI/API e os routers HTTPS explicitos, agora com bind mounts compartilhados de config.toml e storage em /data/restauracao/moneyprinterturbo, fora da imagem. A WebUI exige Basic Auth pelo proxy, com MPT_WEBUI_AUTH armazenado somente no Coolify. A copia de configuracao de producao recebe app.api_key para proteger /api/v1 e /tasks via x-api-key; a configuracao local original nao e alterada. Credenciais serao guardadas no cofre local privado. Nenhum video antigo sera copiado. Implantacao, verificacao HTTPS e persistencia ainda pendentes.
+
+
 Este documento descreve a arquitetura, o fluxo de execucao, os pontos de configuracao e o processo de deploy do fork/custom deployment do **MoneyPrinterTurbo**.
 
 ---
